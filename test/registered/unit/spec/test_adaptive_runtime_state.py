@@ -49,6 +49,7 @@ class _FakePolicy:
         self.candidate_steps = [1, 3]
         self.cuda_graph_bs = None
         self.feedback_step = None
+        self.seen_request_ids = []
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self.cuda_graph_bs = cuda_graph_bs
@@ -57,8 +58,12 @@ class _FakePolicy:
         return 1 if batch_size >= 8 else 3
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        request_ids: list[str] | None = None,
     ) -> int | None:
+        self.seen_request_ids.append(request_ids)
         return self.feedback_step
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
@@ -126,6 +131,113 @@ class TestAdaptiveController(unittest.TestCase):
             ValueError, "Missing adaptive runtime state for steps=1"
         ):
             controller.activate_step_by_batch(batch_size=8)
+
+
+class TestRequestIdentityFeedback(unittest.TestCase):
+    """Request identity must reach the policy, aligned with the counts.
+
+    Without identity a policy cannot attribute a count to the same request on the
+    next decode iteration, so it cannot keep request-local state.
+    """
+
+    def test_request_ids_reach_the_policy(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        controller.on_verify_complete(
+            [5, 1, 0], batch_size=3, request_ids=["r1", "r2", "r3"]
+        )
+
+        self.assertEqual(policy.seen_request_ids[-1], ["r1", "r2", "r3"])
+
+    def test_request_ids_are_optional(self):
+        """Existing callers that pass no ids must keep working."""
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        controller.on_verify_complete([1], batch_size=1)
+
+        self.assertIsNone(policy.seen_request_ids[-1])
+
+    def test_order_is_preserved_index_for_index(self):
+        """Counts and ids must stay aligned; a policy indexes one by the other."""
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        counts = [7, 0, 3, 1]
+        ids = ["a", "b", "c", "d"]
+        controller.on_verify_complete(counts, batch_size=4, request_ids=ids)
+
+        seen = policy.seen_request_ids[-1]
+        self.assertEqual(seen, ids)
+        self.assertEqual(len(seen), len(counts))
+
+    def test_mismatched_lengths_drop_ids_rather_than_misattribute(self):
+        """A misaligned id list is worse than none: it corrupts policy state.
+
+        The failure would be silent, so the ids are dropped and a warning is
+        emitted once instead of passing them through misaligned.
+        """
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        with self.assertLogs(
+            "sglang.srt.speculative.adaptive_runtime_state", level="WARNING"
+        ) as cm:
+            controller.on_verify_complete(
+                [1, 2, 3], batch_size=3, request_ids=["r1", "r2"]
+            )
+
+        self.assertIsNone(policy.seen_request_ids[-1])
+        self.assertTrue(any("dropping request ids" in m for m in cm.output))
+
+    def test_mismatch_warning_is_emitted_only_once(self):
+        """A hot-path warning repeated every decode step would flood the log."""
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        with self.assertLogs(
+            "sglang.srt.speculative.adaptive_runtime_state", level="WARNING"
+        ) as cm:
+            for _ in range(5):
+                controller.on_verify_complete(
+                    [1, 2, 3], batch_size=3, request_ids=["r1"]
+                )
+
+        warnings = [m for m in cm.output if "dropping request ids" in m]
+        self.assertEqual(len(warnings), 1)
+
+    def test_empty_batch_with_empty_ids_is_valid(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        controller.on_verify_complete([], batch_size=0, request_ids=[])
+
+        self.assertEqual(policy.seen_request_ids[-1], [])
+
+    def test_identity_still_allows_a_state_switch(self):
+        """Passing ids must not interfere with the switching behaviour."""
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        controller.on_verify_complete([1], batch_size=1, request_ids=["r1"])
+        policy.feedback_step = 1
+        controller.on_verify_complete([1], batch_size=1, request_ids=["r1"])
+        self.assertEqual(worker.applied_steps, [3, 1])
 
 
 if __name__ == "__main__":

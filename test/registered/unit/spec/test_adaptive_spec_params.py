@@ -394,6 +394,26 @@ class TestBatchSizeRouting(CustomTestCase):
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
 
+    def test_request_ids_are_accepted_and_ignored(self):
+        """The default EMA policy takes the new argument and ignores it.
+
+        It is a batch aggregate with no request-local state, so identity is
+        accepted only to satisfy the interface; behaviour must be unchanged.
+        """
+        params = self._params()
+        for _ in range(40):
+            params.on_verify_complete(
+                [7, 7, 7], batch_size=1, request_ids=["a", "b", "c"]
+            )
+        with_ids = params.get_steps_for_batch(1)
+
+        params2 = self._params()
+        for _ in range(40):
+            params2.on_verify_complete([7, 7, 7], batch_size=1)
+        without_ids = params2.get_steps_for_batch(1)
+
+        self.assertEqual(with_ids, without_ids)
+
 
 class TestResolveCandidateSteps(CustomTestCase):
     def test_default_config(self):

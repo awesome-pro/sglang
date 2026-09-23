@@ -1,5 +1,8 @@
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -60,7 +63,10 @@ class AdaptiveSpecPolicy(Protocol):
     def get_steps_for_batch(self, batch_size: int) -> int: ...
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        request_ids: list[str] | None = None,
     ) -> int | None: ...
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
@@ -76,7 +82,8 @@ class AdaptiveController:
     The worker only needs to:
       1. Call register() for the initial state, then init_states()
          once during startup.
-      2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
+      2. Call on_verify_complete(num_correct_drafts_per_req, request_ids=...)
+         after each decode verify.
     """
 
     def __init__(
@@ -87,6 +94,7 @@ class AdaptiveController:
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
+        self._warned_id_mismatch = False
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -125,11 +133,41 @@ class AdaptiveController:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        request_ids: list[str] | None = None,
     ) -> None:
-        """Feed verify results; switch runtime state if the policy requests it."""
+        """Feed verify results; switch runtime state if the policy requests it.
+
+        `request_ids`, when provided, are the request ids corresponding
+        **index-for-index** to `num_correct_drafts_per_req`, in the same order,
+        for the requests in the batch just verified. They let a policy maintain
+        request-local state across decode iterations, which a positional list of
+        counts alone cannot support: without identity, the same count at the next
+        iteration cannot be attributed to the same request.
+
+        Mismatched lengths would silently attribute one request's acceptance to
+        another, corrupting any state a policy builds on it. Since that failure is
+        invisible and worse than having no ids at all, the ids are dropped (with a
+        one-time warning) rather than passed through misaligned.
+        """
+        if request_ids is not None and len(request_ids) != len(
+            num_correct_drafts_per_req
+        ):
+            if not self._warned_id_mismatch:
+                self._warned_id_mismatch = True
+                logger.warning(
+                    "adaptive spec: dropping request ids for this step -- got %d "
+                    "ids for %d per-request accept counts. Request-local policy "
+                    "state would be attributed to the wrong requests.",
+                    len(request_ids),
+                    len(num_correct_drafts_per_req),
+                )
+            request_ids = None
+
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req, batch_size, request_ids
         )
         if new_step is not None:
             self._activate(new_step)

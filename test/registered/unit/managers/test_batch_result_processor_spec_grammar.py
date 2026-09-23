@@ -64,7 +64,7 @@ class _FakeBatch:
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(model_worker=None) -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -79,7 +79,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         metrics_collector=None,
         metrics_reporter=SimpleNamespace(),
         draft_worker=None,
-        model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        model_worker=model_worker
+        or SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
@@ -87,16 +88,17 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     )
 
 
-def _make_req(terminate_after: int) -> Req:
+def _make_req(terminate_after: int, rid: str = "r0") -> Req:
     sp = SamplingParams(max_new_tokens=256, temperature=0)
     sp.normalize(None)
     req = Req(
-        rid="r0",
+        rid=rid,
         origin_input_text="",
         origin_input_ids=[1, 2, 3],
         sampling_params=sp,
     )
-    req.grammar = _FakeGrammar(terminate_after=terminate_after)
+    if terminate_after is not None:
+        req.grammar = _FakeGrammar(terminate_after=terminate_after)
     req.kv.kv_committed_len = 0
     return req
 
@@ -253,3 +255,83 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _CapturingWorker:
+    """Records what the result processor hands to the spec worker."""
+
+    def __init__(self):
+        self.calls = []
+
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req, **kwargs):
+        self.calls.append((list(num_correct_drafts_per_req), dict(kwargs)))
+
+
+class TestRequestIdentityFeedback(CustomTestCase):
+    """The verify-feedback call must carry request identity, correctly aligned.
+
+    A policy that keeps request-local state indexes the id list by the same
+    position as the count list. If the two were misaligned, acceptance would be
+    attributed to the wrong request -- silently, and permanently, since there is
+    nothing in the payload to reveal it.
+    """
+
+    def test_request_ids_match_batch_reqs_order(self):
+        worker = _CapturingWorker()
+        proc = _make_processor(model_worker=worker)
+        reqs = [
+            _make_req(None, rid="alpha"),
+            _make_req(None, rid="beta"),
+            _make_req(None, rid="gamma"),
+        ]
+        # stride 4, accept_lens [3, 2, 1] -> 3 * 4 flat tokens
+        result = _make_result(4, [3, 2, 1], [101, 102, 103, 0,
+                                             201, 202, 0, 0,
+                                             301, 0, 0, 0])
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch(reqs))
+
+        self.assertEqual(len(worker.calls), 1)
+        counts, kwargs = worker.calls[0]
+        self.assertEqual(kwargs["request_ids"], ["alpha", "beta", "gamma"])
+        self.assertEqual(kwargs["batch_size"], 3)
+        self.assertEqual(len(kwargs["request_ids"]), len(counts))
+
+    def test_corrected_draft_counts_exclude_the_bonus_token(self):
+        """Pins the semantics a request-local estimator is built on."""
+        worker = _CapturingWorker()
+        proc = _make_processor(model_worker=worker)
+        req = _make_req(None, rid="solo")
+        # accept_len 3 with num_non_draft 1 -> 2 accepted drafts
+        result = _make_result(4, [3], [101, 102, 103, 0])
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        counts, kwargs = worker.calls[0]
+        self.assertEqual(counts, [2])
+        self.assertEqual(kwargs["request_ids"], ["solo"])
+
+    def test_alignment_holds_with_grammar_truncation(self):
+        """Grammar truncation must not desynchronise ids from counts."""
+        worker = _CapturingWorker()
+        proc = _make_processor(model_worker=worker)
+        reqs = [_make_req(terminate_after=2, rid="g1"),
+                _make_req(terminate_after=99, rid="g2")]
+        result = _make_result(4, [3, 3], [101, 102, 103, 0,
+                                          201, 202, 203, 0])
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch(reqs))
+
+        counts, kwargs = worker.calls[0]
+        self.assertEqual(kwargs["request_ids"], ["g1", "g2"])
+        self.assertEqual(len(kwargs["request_ids"]), len(counts))
+
+    def test_single_request_batch_still_passes_ids(self):
+        worker = _CapturingWorker()
+        proc = _make_processor(model_worker=worker)
+        proc._resolve_spec_v2_tokens(
+            _make_result(4, [1], [101, 0, 0, 0]),
+            _FakeBatch([_make_req(None, rid="only")]),
+        )
+        _, kwargs = worker.calls[0]
+        self.assertEqual(kwargs["request_ids"], ["only"])

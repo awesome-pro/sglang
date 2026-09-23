@@ -334,9 +334,18 @@ class BaseSpecWorker(ABC):
         return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        request_ids: list[str] | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
+
+        `num_correct_drafts_per_req` is aligned index-for-index with
+        `request_ids` when it is provided, so an adaptive policy can keep
+        request-local state. Ids are attached to the existing
+        `note_request_finished` hook, which lets a policy release that state when
+        a request completes.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.

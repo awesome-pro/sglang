@@ -303,11 +303,20 @@ class AdaptiveSpeculativeParams:
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        request_ids: list[str] | None = None,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
 
         Returns the new step if a switch is warranted, else ``None``.
+
+        `request_ids` identifies the requests these counts belong to,
+        index-for-index. The default policy deliberately ignores them: it is a
+        batch-aggregate EMA with no request-local state. The parameter exists so
+        policies that do keep such state receive identity through the same
+        interface.
         """
         params = self._route(batch_size)
         if params.update(num_correct_drafts_per_req):

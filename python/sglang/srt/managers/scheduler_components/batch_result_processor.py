@@ -774,8 +774,18 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        #
+        # Request ids are passed alongside the counts, aligned index-for-index
+        # with batch.reqs (the same order num_correct_drafts_per_req_cpu was
+        # built in). Without them a policy cannot tell which request a count
+        # belongs to on the next decode iteration, so it cannot keep
+        # request-local acceptance state. Building the list is cheap: rids are
+        # already-resident Python strings, and this runs once per decode step,
+        # not per token.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            request_ids=[req.rid for req in batch.reqs],
         )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):

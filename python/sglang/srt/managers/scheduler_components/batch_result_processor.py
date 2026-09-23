@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
+from sglang.srt.speculative import heterospec_trace as _heterospec_trace
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -777,6 +778,17 @@ class SchedulerBatchResultProcessor:
         self.model_worker.on_verify_complete_cpu(
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
+
+        # HeteroSpec research trace (experimental, env-gated, off by default).
+        # Preserves the one thing the per-request histograms cannot: which
+        # requests were in the batch together and at what active K. Guarded on
+        # `enabled()` so a disabled server never builds the rid list.
+        if _heterospec_trace.enabled():
+            _heterospec_trace.record_iteration(
+                active_k=getattr(self.draft_worker, "speculative_num_steps", None),
+                rids=[req.rid for req in batch.reqs],
+                accepted=result.num_correct_drafts_per_req_cpu,
+            )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
         # the EAGLE overlap path already did this inside verify() via the grammar

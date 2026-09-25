@@ -61,8 +61,38 @@ def _make_device_pool(layer_num=LAYER_NUM, size=POOL_SIZE):
     )
 
 
+#: Pools created during the current test, torn down by _Int8PoolTestCase.
+_LIVE_POOLS: list = []
+
+
+class _Int8PoolTestCase(unittest.TestCase):
+    """Base that unregisters every host arena a test created.
+
+    The arena is pinned with cudaHostRegister. Dropping the Python reference is
+    not enough: the CUDA registration survives until the buffer is unregistered,
+    so when a later test's allocator is handed the same address range,
+    cudaHostRegister fails with "part or all of the requested memory range is
+    already mapped". That cascaded into 20 spurious failures across the suite,
+    masking whatever real problems existed underneath.
+
+    destroy() is idempotent and unregisters kv_buffer, so tearing down here is
+    safe even when a test already destroyed its pool explicitly.
+    """
+
+    def setUp(self):
+        _LIVE_POOLS.clear()
+
+    def tearDown(self):
+        for pool in _LIVE_POOLS:
+            try:
+                pool.destroy()
+            except Exception:  # noqa: BLE001 - teardown must not mask a failure
+                pass
+        _LIVE_POOLS.clear()
+
+
 def _make_host_pool(device_pool, *, host_size=0, ratio=2.0, layout="layer_first", **kw):
-    return MHATokenToKVPoolHostINT8(
+    pool = MHATokenToKVPoolHostINT8(
         device_pool,
         host_to_device_ratio=ratio,
         host_size=host_size,
@@ -73,6 +103,8 @@ def _make_host_pool(device_pool, *, host_size=0, ratio=2.0, layout="layer_first"
         allocator_type="default",
         **kw,
     )
+    _LIVE_POOLS.append(pool)
+    return pool
 
 
 def _fill(device_pool, *, seed=0, num_layers=None):
@@ -86,7 +118,7 @@ def _fill(device_pool, *, seed=0, num_layers=None):
             buf.copy_(values.to(torch.bfloat16))
 
 
-class TestSizing(unittest.TestCase):
+class TestSizing(_Int8PoolTestCase):
     def test_size_per_token_is_the_encoded_size(self):
         device_pool = _make_device_pool()
         host_pool = _make_host_pool(device_pool)
@@ -112,6 +144,8 @@ class TestSizing(unittest.TestCase):
             pin_memory=True,
             device="cpu",
         )
+        # The baseline pool pins its arena too, so it needs the same teardown.
+        _LIVE_POOLS.append(bf16_pool)
         self.assertEqual(bf16_pool.size_per_token, 4096 * LAYER_NUM)
         self.assertEqual(int8_pool.size_per_token, 2304 * LAYER_NUM)
         # Ratio holds to within the +1 page slack.
@@ -143,7 +177,7 @@ class TestSizing(unittest.TestCase):
         host_pool.destroy()
 
 
-class TestTransferRoundtrip(unittest.TestCase):
+class TestTransferRoundtrip(_Int8PoolTestCase):
     def test_d2h_then_h2d_reconstructs_within_bound(self):
         device_pool = _make_device_pool()
         host_pool = _make_host_pool(device_pool)
@@ -281,7 +315,7 @@ class TestTransferRoundtrip(unittest.TestCase):
         self.assertGreater(float(device_pool.k_buffer[0][src].float().abs().max()), 0.0)
 
 
-class TestStagingGrowth(unittest.TestCase):
+class TestStagingGrowth(_Int8PoolTestCase):
     def test_large_transfer_grows_staging_and_still_round_trips(self):
         device_pool = _make_device_pool(size=4096)
         host_pool = _make_host_pool(device_pool)
@@ -408,7 +442,7 @@ class TestStagingGrowth(unittest.TestCase):
         self.assertEqual([int(v) for v in host_pool._d2h_k_src_ptrs], expected)
 
 
-class TestAllocFree(unittest.TestCase):
+class TestAllocFree(_Int8PoolTestCase):
     def test_alloc_free_reuse(self):
         device_pool = _make_device_pool()
         host_pool = _make_host_pool(device_pool)
@@ -435,7 +469,7 @@ class TestAllocFree(unittest.TestCase):
         host_pool.destroy()
 
 
-class TestStoragePages(unittest.TestCase):
+class TestStoragePages(_Int8PoolTestCase):
     def test_data_page_round_trip(self):
         device_pool = _make_device_pool()
         host_pool = _make_host_pool(device_pool)
@@ -477,7 +511,7 @@ class TestStoragePages(unittest.TestCase):
         host_pool.destroy()
 
 
-class TestFailFast(unittest.TestCase):
+class TestFailFast(_Int8PoolTestCase):
     """Every unsupported configuration must raise at construction, not corrupt
     generations later."""
 
@@ -654,7 +688,7 @@ class TestFailFast(unittest.TestCase):
         host_pool.destroy()
 
 
-class TestDispatch(unittest.TestCase):
+class TestDispatch(_Int8PoolTestCase):
     def test_env_flag_selects_int8_pool(self):
         device_pool = _make_device_pool()
         with mock.patch.dict(

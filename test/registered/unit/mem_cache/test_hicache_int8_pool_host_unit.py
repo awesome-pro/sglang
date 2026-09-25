@@ -537,6 +537,9 @@ class TestFailFast(_Int8PoolTestCase):
 
     def test_rejects_quantized_device_pool(self):
         device_pool = _make_device_pool()
+        # is_quantized_kv_cache IS a property on KVCache (memory_pool.py:2147),
+        # so unlike v_head_dim and start_layer this one must be patched on the
+        # class; there is no instance attribute to shadow.
         with mock.patch.object(
             type(device_pool), "is_quantized_kv_cache", property(lambda self: True)
         ):
@@ -552,9 +555,10 @@ class TestFailFast(_Int8PoolTestCase):
 
     def test_rejects_asymmetric_head_dims(self):
         device_pool = _make_device_pool()
-        with mock.patch.object(
-            type(device_pool), "v_head_dim", property(lambda self: 64)
-        ):
+        # v_head_dim is an INSTANCE attribute (memory_pool.py:2018), not a class
+        # one, so mock.patch.object(type(pool), ...) raises AttributeError. Patch
+        # the instance instead.
+        with mock.patch.object(device_pool, "v_head_dim", 64):
             with self.assertRaises(NotImplementedError) as ctx:
                 _make_host_pool(device_pool)
         self.assertIn("symmetric", str(ctx.exception))
@@ -647,9 +651,8 @@ class TestFailFast(_Int8PoolTestCase):
     def test_rejects_a_partial_device_pool(self):
         """A pool that does not start at layer 0 cannot be backed up wholesale."""
         device_pool = _make_device_pool()
-        with mock.patch.object(
-            type(device_pool), "start_layer", property(lambda self: 2)
-        ):
+        # start_layer is an INSTANCE attribute too; patch the instance.
+        with mock.patch.object(device_pool, "start_layer", 2):
             with self.assertRaises(NotImplementedError) as ctx:
                 _make_host_pool(device_pool)
         self.assertIn("covering every layer", str(ctx.exception))

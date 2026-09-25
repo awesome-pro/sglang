@@ -242,11 +242,10 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
         # than discovering a partial transfer later as wrong output.
         #
         # ``end_layer`` is INCLUSIVE -- the last valid layer index, set by
-        # KVCache as ``end_layer or layer_num - 1`` -- so a full pool reports
-        # layer_num - 1, not layer_num. Note MHATokenToKVPool.__init__ does not
-        # accept start_layer/end_layer at all, so an ordinary pool always takes
-        # those defaults; this check exists for the configurator paths that do
-        # pass them.
+        # KVCache as ``end_layer or layer_num - 1`` (memory_pool.py:1857) -- so a
+        # full pool reports layer_num - 1, not layer_num. MHATokenToKVPool does
+        # accept start_layer/end_layer (memory_pool.py:1988), so a pool built
+        # with an explicit sub-range really does reach this check.
         start_layer = getattr(device_pool, "start_layer", 0)
         end_layer = getattr(device_pool, "end_layer", device_pool.layer_num - 1)
         if start_layer != 0 or end_layer < device_pool.layer_num - 1:

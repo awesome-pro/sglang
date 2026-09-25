@@ -293,13 +293,82 @@ class TestStagingGrowth(unittest.TestCase):
         host_pool.backup_from_device_all_layer(device_pool, dst, src, "kernel")
         torch.cuda.synchronize()
         self.assertGreater(host_pool._d2h.capacity, initial_capacity)
-        self.assertEqual(host_pool._d2h.capacity, host_pool._h2d.capacity)
         for layer in range(LAYER_NUM):
             device_pool.k_buffer[layer].zero_()
         for layer in range(LAYER_NUM):
             host_pool.load_to_device_per_layer(device_pool, dst, src, layer, "kernel")
         torch.cuda.synchronize()
         self.assertGreater(float(device_pool.k_buffer[0][src].float().abs().max()), 0.0)
+
+    def test_d2h_growth_does_not_reallocate_h2d_staging(self):
+        """Regression: a backup must not free storage another stream is reading.
+
+        The two directions run on independent streams and can be in flight at
+        once. If a D2H-triggered growth reallocated the H2D buffers, an in-flight
+        load would read freed memory. Each direction may grow only for its own
+        transfers.
+        """
+        device_pool = _make_device_pool(size=4096)
+        host_pool = _make_host_pool(device_pool)
+        _fill(device_pool)
+
+        h2d_k_ptr = host_pool._h2d.k.data_ptr()
+        h2d_v_ptr = host_pool._h2d.v.data_ptr()
+        h2d_capacity = host_pool._h2d.capacity
+
+        count = host_pool._d2h.capacity + 100  # force D2H growth
+        src = torch.arange(count, device=DEVICE, dtype=torch.int64)
+        dst = torch.arange(count, device=DEVICE, dtype=torch.int64)
+        host_pool.backup_from_device_all_layer(device_pool, dst, src, "kernel")
+        torch.cuda.synchronize()
+
+        self.assertGreater(host_pool._d2h.capacity, h2d_capacity)
+        self.assertEqual(
+            host_pool._h2d.k.data_ptr(),
+            h2d_k_ptr,
+            "D2H growth must not move the H2D K staging buffer",
+        )
+        self.assertEqual(
+            host_pool._h2d.v.data_ptr(),
+            h2d_v_ptr,
+            "D2H growth must not move the H2D V staging buffer",
+        )
+        self.assertEqual(host_pool._h2d.capacity, h2d_capacity)
+
+    def test_h2d_growth_does_not_reallocate_d2h_staging(self):
+        """The symmetric guard: a load must not free a backup's staging."""
+        device_pool = _make_device_pool(size=8192)
+        host_pool = _make_host_pool(device_pool)
+
+        d2h_k_ptr = host_pool._d2h.k.data_ptr()
+        d2h_capacity = host_pool._d2h.capacity
+        d2h_tables = [int(v) for v in host_pool._d2h_k_src_ptrs]
+
+        count = host_pool._h2d.capacity + 100
+        host_pool._ensure_h2d_capacity(count)
+
+        self.assertGreater(host_pool._h2d.capacity, count - 1)
+        self.assertEqual(
+            host_pool._d2h.k.data_ptr(),
+            d2h_k_ptr,
+            "H2D growth must not move the D2H K staging buffer",
+        )
+        self.assertEqual(host_pool._d2h.capacity, d2h_capacity)
+        self.assertEqual(
+            [int(v) for v in host_pool._d2h_k_src_ptrs],
+            d2h_tables,
+            "H2D growth must not invalidate the D2H staging pointer tables",
+        )
+
+    def test_staging_index_view_covers_the_larger_direction(self):
+        """The shared index list must be long enough for whichever direction grew."""
+        device_pool = _make_device_pool(size=8192)
+        host_pool = _make_host_pool(device_pool)
+        big = host_pool._d2h.capacity + 500
+        host_pool._ensure_h2d_capacity(big)
+        view = host_pool._staging_index_view(big)
+        self.assertGreaterEqual(view.numel(), big)
+        self.assertEqual(int(view[-1]), big - 1)
 
     def test_pointer_tables_follow_growth(self):
         device_pool = _make_device_pool(size=4096)

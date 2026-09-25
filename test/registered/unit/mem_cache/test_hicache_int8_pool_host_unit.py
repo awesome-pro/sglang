@@ -235,8 +235,11 @@ class TestTransferRoundtrip(_Int8PoolTestCase):
         host_pool.backup_from_device_all_layer(device_pool, dst, src, "kernel")
         torch.cuda.synchronize()
 
+        # k_data_refs are views of the CPU host arena, so they must be indexed
+        # with CPU indices. `src`/`dst` live on the GPU because the mover
+        # requires device index tensors.
         raw = device_pool.k_buffer[0][src]
-        stored = host_pool.k_data_refs[0][dst]
+        stored = host_pool.k_data_refs[0][dst.cpu()]
         self.assertEqual(stored.dtype, torch.uint8)
         # 1152 encoded bytes per row against 2048 raw bytes.
         self.assertEqual(stored.numel(), len(src) * codec.ROW_BYTES)
@@ -259,7 +262,10 @@ class TestTransferRoundtrip(_Int8PoolTestCase):
         dst = torch.tensor([0, 1], device=DEVICE, dtype=torch.int64)
         host_pool.backup_from_device_all_layer(device_pool, dst, src, "kernel")
         torch.cuda.synchronize()
-        padding = host_pool.k_data_refs[0][dst][:, codec.PAYLOAD_BYTES + codec.SCALE_BYTES :]
+        # Host arena is on CPU; index with CPU indices.
+        padding = host_pool.k_data_refs[0][dst.cpu()][
+            :, codec.PAYLOAD_BYTES + codec.SCALE_BYTES :
+        ]
         self.assertTrue(bool((padding == 0).all()))
 
     def test_all_zero_kv_round_trips_exactly(self):
@@ -444,13 +450,43 @@ class TestStagingGrowth(_Int8PoolTestCase):
 
 class TestAllocFree(_Int8PoolTestCase):
     def test_alloc_free_reuse(self):
+        """free() must make slots allocatable again when the list is exhausted.
+
+        Freed slots are deliberately NOT handed straight back: alloc() takes from
+        the FRONT of free_slots while free() appends to release_slots, merged
+        onto the END only when the free list runs short
+        (pool_host/base.py: _merge_release_slots). So immediately after freeing
+        [0,1,2,3] the next alloc correctly returns [4,5,6,7] -- asserting that
+        the same slots come back contradicts the contract.
+
+        The property that actually matters is reclamation: once nothing else is
+        free, the released slots must be reusable. Exhausting the pool first
+        makes that observable.
+        """
         device_pool = _make_device_pool()
         host_pool = _make_host_pool(device_pool)
-        first = host_pool.alloc(PAGE_SIZE * 4)
-        self.assertIsNotNone(first)
-        self.assertEqual(host_pool.free(first), 4)
-        second = host_pool.alloc(PAGE_SIZE * 4)
-        self.assertEqual(sorted(second.tolist()), sorted(first.tolist()))
+
+        total = host_pool.available_size()
+        self.assertGreater(total, 8, "pool too small for this test")
+
+        # Take everything, so any later allocation must come from the release list.
+        everything = host_pool.alloc(total)
+        self.assertIsNotNone(everything)
+        self.assertEqual(host_pool.available_size(), 0)
+        self.assertIsNone(host_pool.alloc(PAGE_SIZE), "pool should be exhausted")
+
+        # Release the first four slots and reclaim them.
+        released = everything[:4].clone()
+        self.assertEqual(host_pool.free(released), 4)
+        self.assertEqual(host_pool.available_size(), 4)
+
+        again = host_pool.alloc(4)
+        self.assertIsNotNone(again, "released slots must be reallocatable")
+        self.assertEqual(
+            sorted(again.tolist()),
+            sorted(released.tolist()),
+            "with nothing else free, the released slots are the only candidates",
+        )
         host_pool.destroy()
 
     def test_double_free_is_detected(self):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -133,6 +134,38 @@ class FullComponent(TreeComponent):
             if full_host is not None:
                 kv_host_hit += len(full_host)
             node = node.parent
+        # Diagnostic: this walk is the sole source of host_hit_length, which in
+        # turn is the only trigger for load-back. When it yields 0 the request
+        # silently re-prefills, so record what it actually saw. Enabled with
+        # SGLANG_HICACHE_DEBUG_MATCH=1; a no-op otherwise.
+        if os.environ.get("SGLANG_HICACHE_DEBUG_MATCH"):
+            import logging
+
+            _chain = []
+            _n = result.best_match_node
+            while _n is not root_node and len(_chain) < 8:
+                _hv = _n.component_data[ct].host_value
+                _chain.append(
+                    (_n.id, _n.evicted, _n.backuped, len(_hv) if _hv is not None else None)
+                )
+                _n = _n.parent
+
+            logging.getLogger(__name__).warning(
+                "HiCache match walk: best_match=%s last_device=%s evicted=%s "
+                "backuped=%s host_value=%s parent_chain=%s -> kv_host_hit=%d",
+                result.best_match_node.id,
+                result.last_device_node.id,
+                result.best_match_node.evicted,
+                result.best_match_node.backuped,
+                (
+                    len(result.best_match_node.component_data[ct].host_value)
+                    if result.best_match_node.component_data[ct].host_value
+                    is not None
+                    else None
+                ),
+                _chain,
+                kv_host_hit,
+            )
         if kv_host_hit > 0:
             return result._replace(
                 host_hit_length=max(result.host_hit_length, kv_host_hit)

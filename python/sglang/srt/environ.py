@@ -755,6 +755,13 @@ class Envs:
     # Rows of device staging per direction for the INT8 HiCache path. Transfers
     # larger than this grow the buffer; this only sets the initial allocation.
     SGLANG_HICACHE_INT8_STAGING_TOKENS = EnvInt(2048)
+    # Record per-phase GPU time for the INT8 codec (encode, decode, and the two
+    # mover calls) with CUDA events. Off by default: the events are cheap but
+    # they are still hot-path work. Timings are written on teardown to
+    # SGLANG_HICACHE_INT8_TIMING_PATH. Used to decide whether fused Triton
+    # kernels are worth writing.
+    SGLANG_HICACHE_INT8_TIMING = EnvBool(False)
+    SGLANG_HICACHE_INT8_TIMING_PATH = EnvStr(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

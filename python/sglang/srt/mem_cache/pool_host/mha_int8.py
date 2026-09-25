@@ -40,7 +40,9 @@ the width on both sides of the mover.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Sequence
 
 import torch
@@ -68,6 +70,90 @@ SUPPORTED_LAYOUTS = ("layer_first",)
 #: io_backend values the pool can use. ``direct`` and ``kernel_ascend`` both
 #: assume raw BF16 rows in the host buffer.
 SUPPORTED_IO_BACKENDS = ("kernel",)
+
+
+# ---------------------------------------------------------------------------
+# Codec timing
+# ---------------------------------------------------------------------------
+#
+# SGLang's own hicache_backup_duration_seconds / load_back_duration_seconds
+# histograms cover the whole transfer, which conflates the codec with the D2H
+# copy. Phase 17 needs to know whether quantise/dequantise is a meaningful share
+# of the L2 path, because if it is not, Triton is not worth writing.
+#
+# CUDA events measure this without adding a synchronisation: event.record() is
+# enqueued on the current stream, and elapsed_time() is only called when the
+# stats are written, which happens during teardown. Nothing here touches the hot
+# path's ordering.
+_CODEC_TIMING_ENV = "SGLANG_HICACHE_INT8_TIMING"
+_CODEC_TIMING_PATH_ENV = "SGLANG_HICACHE_INT8_TIMING_PATH"
+
+
+class _CodecTiming:
+    """Accumulates per-phase GPU time using CUDA events."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.totals_ms: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self._open: dict[str, torch.cuda.Event] = {}
+
+    def start(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._open[phase] = ev
+
+    def stop(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        begin = self._open.pop(phase, None)
+        if begin is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        # Recorded, not read: elapsed_time() is deferred to write().
+        self._pending = getattr(self, "_pending", [])
+        self._pending.append((phase, begin, end))
+
+    def write(self, path: str | None = None) -> dict:
+        """Resolve the pending events and dump totals.
+
+        Called once during teardown. elapsed_time() synchronises internally,
+        which is safe here precisely because it is not on the transfer path.
+        """
+        if not self.enabled:
+            return {}
+        for phase, begin, end in getattr(self, "_pending", []):
+            try:
+                ms = begin.elapsed_time(end)
+            except Exception:  # noqa: BLE001 - timing must never break teardown
+                continue
+            self.totals_ms[phase] = self.totals_ms.get(phase, 0.0) + ms
+            self.counts[phase] = self.counts.get(phase, 0) + 1
+        self._pending = []
+        report = {
+            "phases": {
+                phase: {
+                    "total_ms": round(self.totals_ms[phase], 4),
+                    "calls": self.counts[phase],
+                    "mean_ms": round(
+                        self.totals_ms[phase] / max(1, self.counts[phase]), 4
+                    ),
+                }
+                for phase in sorted(self.totals_ms)
+            },
+            "unit": "GPU milliseconds, measured with CUDA events on the transfer stream",
+        }
+        target = path or os.environ.get(_CODEC_TIMING_PATH_ENV)
+        if target:
+            try:
+                with open(target, "w") as fh:
+                    json.dump(report, fh, indent=2)
+            except OSError as exc:
+                logger.warning("could not write codec timing to %s: %s", target, exc)
+        return report
 
 
 def _retire(buffers: staging.StagingBuffers, device: torch.device | str) -> None:
@@ -164,6 +250,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             pool_label=pool_label,
         )
 
+        self._timing = _CodecTiming(enabled=bool(envs.SGLANG_HICACHE_INT8_TIMING.get()))
         self._init_staging_buffers()
         self._log_configuration()
 
@@ -507,6 +594,10 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
 
         device_indices = device_indices.to(torch.int64)
         head_num, head_dim = self.head_num, self.head_dim
+        # Encode time: index_select + amax/round/clamp/cast + record packing.
+        # Measured separately from the mover below so the codec's share of the
+        # L2 path is attributable.
+        self._timing.start("encode")
         # k_buffer / v_buffer are indexed by local layer, and validation above
         # guarantees the device pool covers every layer with start_layer == 0.
         for layer in range(device_pool.layer_num):
@@ -521,8 +612,10 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
                 self._d2h.layer_v(layer, num_tokens),
             )
 
+        self._timing.stop("encode")
         # One byte-for-byte move of every layer. Both sides are ROW_BYTES wide,
         # so a single element_size is correct on both.
+        self._timing.start("d2h_move")
         jit_transfer_hicache_all_layer(
             page_size=1,
             k_ptr_dst=self._d2h_k_dst_ptrs,
@@ -535,6 +628,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             kv_cache_dst_stride_bytes=codec.ROW_BYTES,
             element_size=codec.ROW_BYTES,
         )
+        self._timing.stop("d2h_move")
 
     # ------------------------------------------------------------------
     # H2D: move, then decode
@@ -591,6 +685,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
         # bf16 destination is rejected outright.
         k_records = self._h2d.layer_k(layer_id, num_tokens)
         v_records = self._h2d.layer_v(layer_id, num_tokens)
+        self._timing.start("h2d_move")
         jit_transfer_hicache_one_layer(
             page_size=1,
             k_cache_dst=k_records,
@@ -602,7 +697,9 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             element_dim=codec.ROW_BYTES,
         )
 
+        self._timing.stop("h2d_move")
         # Decode and scatter into the device pool. Enqueued here, before return.
+        self._timing.start("decode")
         scatter = device_indices.to(torch.int64)
         dtype = device_pool.store_dtype
         k_bf16 = codec.decode_records(
@@ -617,10 +714,26 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
         device_pool.v_buffer[layer_id][scatter] = v_bf16.reshape(
             num_tokens, self.head_num, self.head_dim
         )
+        self._timing.stop("decode")
 
     # ------------------------------------------------------------------
     # Storage (L3) page interface
     # ------------------------------------------------------------------
+
+    def destroy(self):
+        """Flush codec timings before releasing the arena.
+
+        Done here rather than in a metrics callback because the pool has no
+        handle on the metrics collector, and because reading CUDA event times
+        synchronises -- which is acceptable during teardown and not before.
+        """
+        try:
+            report = self._timing.write()
+            if report.get("phases"):
+                logger.info("HiCache INT8 codec timing: %s", report["phases"])
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail
+            logger.warning("codec timing flush failed: %s", exc)
+        super().destroy()
 
     def _storage_pages_unsupported(self) -> NotImplementedError:
         return NotImplementedError(

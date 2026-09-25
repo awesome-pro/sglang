@@ -261,12 +261,20 @@ class TestTransferRoundtrip(_Int8PoolTestCase):
         )
         # Decoding the arena must reproduce the device row within bound, which
         # proves it really is an encoding rather than padding.
+        #
+        # The comparison happens entirely on CPU. `stored` is a view of the CPU
+        # host arena, so `decoded` is CPU, while `raw` was gathered from the GPU
+        # device pool -- folding them together directly raises "Expected all
+        # tensors to be on the same device, but found at least two devices,
+        # cuda:0 and cpu!". Moving `raw` once keeps the arithmetic on one device.
+        raw_cpu = raw.cpu()
         decoded = codec.decode_records(
             stored, head_num=HEAD_NUM, head_dim=HEAD_DIM, dtype=torch.bfloat16
         )
-        scales = codec.compute_scales(raw)
+        self.assertEqual(decoded.device.type, "cpu")
+        scales = codec.compute_scales(raw_cpu)
         bound = error_bound(decoded, scales)
-        err = (decoded.float() - raw.float()).abs()
+        err = (decoded.float() - raw_cpu.float()).abs()
         self.assertEqual(int((err > bound).sum()), 0)
 
     def test_padding_bytes_are_zero_in_the_arena(self):

@@ -526,7 +526,13 @@ class TestFailFast(unittest.TestCase):
         self.assertIn("symmetric", str(ctx.exception))
 
     def test_rejects_wrong_head_geometry(self):
-        """head_num * head_dim must equal the 1024-byte payload exactly."""
+        """A local KV head count the fixed record cannot express is rejected.
+
+        head_num=4 gives a 512-byte payload against the record's fixed 1024, so
+        the pool must refuse. The TP guard fires first and raises
+        NotImplementedError naming the restriction; codec.check_layout would
+        raise ValueError for the same pool, which is why both are accepted here.
+        """
         pool = MHATokenToKVPool(
             size=POOL_SIZE,
             page_size=PAGE_SIZE,
@@ -537,8 +543,13 @@ class TestFailFast(unittest.TestCase):
             device=DEVICE,
             enable_memory_saver=False,
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises((NotImplementedError, ValueError)) as ctx:
             _make_host_pool(pool)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "TP=1" in message or "payload" in message,
+            f"unhelpful rejection message: {message}",
+        )
 
     def test_rejects_non_two_byte_dtype(self):
         pool = MHATokenToKVPool(
@@ -583,6 +594,31 @@ class TestFailFast(unittest.TestCase):
         # Per-token stride must be one full record on both sides.
         self.assertEqual(dv.stride()[0] * dv.element_size(), codec.ROW_BYTES)
         self.assertEqual(sv.stride()[0] * sv.element_size(), codec.ROW_BYTES)
+
+    def test_accepts_a_normal_device_pool(self):
+        """Regression: end_layer is INCLUSIVE, so a full pool reports layer_num-1.
+
+        KVCache sets ``end_layer = end_layer or layer_num - 1``, and
+        MHATokenToKVPool.__init__ does not accept start_layer/end_layer at all.
+        An earlier version of the coverage check demanded end_layer == layer_num
+        and rejected every ordinary pool.
+        """
+        device_pool = _make_device_pool()
+        self.assertEqual(device_pool.start_layer, 0)
+        self.assertEqual(device_pool.end_layer, LAYER_NUM - 1)
+        host_pool = _make_host_pool(device_pool)
+        self.assertEqual(host_pool.layer_num, LAYER_NUM)
+        host_pool.destroy()
+
+    def test_rejects_a_partial_device_pool(self):
+        """A pool that does not start at layer 0 cannot be backed up wholesale."""
+        device_pool = _make_device_pool()
+        with mock.patch.object(
+            type(device_pool), "start_layer", property(lambda self: 2)
+        ):
+            with self.assertRaises(NotImplementedError) as ctx:
+                _make_host_pool(device_pool)
+        self.assertIn("covering every layer", str(ctx.exception))
 
     def test_rejects_tp_greater_than_one_by_name(self):
         """TP>1 must fail with a legible message, not a payload mismatch.

@@ -238,13 +238,30 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
                 "INT8 HiCache host pool does not support layer-sharded device pools."
             )
         # backup_from_device_all_layer walks device_pool.k_buffer[0 .. layer_num)
-        # and relies on those being the whole picture. Assert it now rather than
-        # discovering a partial transfer as wrong output later.
-        if device_pool.start_layer != 0 or device_pool.end_layer != device_pool.layer_num:
+        # and relies on those being the whole picture. Assert that here rather
+        # than discovering a partial transfer later as wrong output.
+        #
+        # ``end_layer`` is INCLUSIVE -- the last valid layer index, set by
+        # KVCache as ``end_layer or layer_num - 1`` -- so a full pool reports
+        # layer_num - 1, not layer_num. Note MHATokenToKVPool.__init__ does not
+        # accept start_layer/end_layer at all, so an ordinary pool always takes
+        # those defaults; this check exists for the configurator paths that do
+        # pass them.
+        start_layer = getattr(device_pool, "start_layer", 0)
+        end_layer = getattr(device_pool, "end_layer", device_pool.layer_num - 1)
+        if start_layer != 0 or end_layer < device_pool.layer_num - 1:
             raise NotImplementedError(
-                f"INT8 HiCache host pool expects a device pool covering all layers, "
-                f"got start_layer={device_pool.start_layer} "
-                f"end_layer={device_pool.end_layer} layer_num={device_pool.layer_num}."
+                f"INT8 HiCache host pool expects a device pool covering every layer "
+                f"from 0, got start_layer={start_layer} end_layer={end_layer} "
+                f"(inclusive) for layer_num={device_pool.layer_num}."
+            )
+        # ``k_buffer`` is None until the device pool has created its buffers, so
+        # only assert the count when there is one to count.
+        kb = getattr(device_pool, "k_buffer", None)
+        if kb is not None and len(kb) != device_pool.layer_num:
+            raise NotImplementedError(
+                f"INT8 HiCache host pool expects one device K buffer per layer, got "
+                f"{len(kb)} buffers for layer_num={device_pool.layer_num}."
             )
         if device_pool.page_size != page_size:
             raise NotImplementedError(

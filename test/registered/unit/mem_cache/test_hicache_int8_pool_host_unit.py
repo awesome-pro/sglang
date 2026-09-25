@@ -360,15 +360,41 @@ class TestStagingGrowth(unittest.TestCase):
             "H2D growth must not invalidate the D2H staging pointer tables",
         )
 
-    def test_staging_index_view_covers_the_larger_direction(self):
-        """The shared index list must be long enough for whichever direction grew."""
+    def test_index_lists_are_per_direction(self):
+        """Each direction owns its index list, so growth cannot strand the other.
+
+        Regression: a single shared list meant an H2D-triggered extension could
+        drop the old tensor while the D2H stream still had it referenced. Separate
+        lists remove the question entirely.
+        """
         device_pool = _make_device_pool(size=8192)
         host_pool = _make_host_pool(device_pool)
-        big = host_pool._d2h.capacity + 500
+        self.assertIsNot(host_pool._d2h_indices, host_pool._h2d_indices)
+
+        d2h_before = host_pool._d2h_indices
+        big = host_pool._h2d.capacity + 500
         host_pool._ensure_h2d_capacity(big)
-        view = host_pool._staging_index_view(big)
+
+        # The D2H list is untouched, and the H2D list covers the new size.
+        self.assertIs(host_pool._d2h_indices, d2h_before)
+        view = host_pool._h2d_index_view(big)
         self.assertGreaterEqual(view.numel(), big)
         self.assertEqual(int(view[-1]), big - 1)
+
+    def test_d2h_growth_extends_only_the_d2h_index_list(self):
+        device_pool = _make_device_pool(size=8192)
+        host_pool = _make_host_pool(device_pool)
+        _fill(device_pool)
+        h2d_before = host_pool._h2d_indices
+
+        count = host_pool._d2h.capacity + 100
+        src = torch.arange(count, device=DEVICE, dtype=torch.int64)
+        dst = torch.arange(count, device=DEVICE, dtype=torch.int64)
+        host_pool.backup_from_device_all_layer(device_pool, dst, src, "kernel")
+        torch.cuda.synchronize()
+
+        self.assertIs(host_pool._h2d_indices, h2d_before)
+        self.assertGreaterEqual(host_pool._d2h_index_view(count).numel(), count)
 
     def test_pointer_tables_follow_growth(self):
         device_pool = _make_device_pool(size=4096)
@@ -527,6 +553,58 @@ class TestFailFast(unittest.TestCase):
         )
         with self.assertRaises((NotImplementedError, ValueError)):
             _make_host_pool(pool)
+
+    def test_h2d_mover_sees_one_dtype_on_both_sides(self):
+        """run_one() binds a single SymbolicDType across src and dst.
+
+        Regression: the H2D move once viewed only the *destination* as bf16 while
+        leaving the uint8 arena as the source, which the kernel rejects. The move
+        is now a straight uint8 byte copy at element_dim = ROW_BYTES, so both
+        sides agree on dtype and the byte width is unchanged.
+        """
+        device_pool = _make_device_pool()
+        host_pool = _make_host_pool(device_pool)
+        num_tokens = 4
+
+        # Exactly the tensors the H2D call passes to the mover.
+        dst = host_pool._h2d.layer_k(0, num_tokens)
+        src = host_pool.k_data_refs[0]
+
+        self.assertEqual(dst.dtype, src.dtype, "H2D src/dst dtypes must match")
+        self.assertEqual(dst.dtype, torch.uint8)
+
+        dv = dst.view(-1, codec.ROW_BYTES)
+        sv = src.view(-1, codec.ROW_BYTES)
+        element_size = codec.ROW_BYTES * dv.element_size()
+        self.assertEqual(element_size, codec.ROW_BYTES)
+        self.assertEqual(element_size, 1152)
+        # Element size must be a 128-byte multiple for the JIT kernel.
+        self.assertEqual(element_size % codec.ALIGNMENT_BYTES, 0)
+        # Per-token stride must be one full record on both sides.
+        self.assertEqual(dv.stride()[0] * dv.element_size(), codec.ROW_BYTES)
+        self.assertEqual(sv.stride()[0] * sv.element_size(), codec.ROW_BYTES)
+
+    def test_rejects_tp_greater_than_one_by_name(self):
+        """TP>1 must fail with a legible message, not a payload mismatch.
+
+        The record is fixed at 8 local KV heads; at TP=2 there are 4, so the
+        whole format changes. The error should say so.
+        """
+        pool = MHATokenToKVPool(
+            size=POOL_SIZE,
+            page_size=PAGE_SIZE,
+            head_num=4,  # TP=2 on Qwen3-8B: 8 KV heads / 2
+            head_dim=HEAD_DIM,
+            dtype=torch.bfloat16,
+            layer_num=LAYER_NUM,
+            device=DEVICE,
+            enable_memory_saver=False,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            _make_host_pool(pool)
+        message = str(ctx.exception)
+        self.assertIn("TP=1", message)
+        self.assertIn("local KV heads", message)
 
     def test_rejects_unknown_io_backend_at_transfer_time(self):
         device_pool = _make_device_pool()

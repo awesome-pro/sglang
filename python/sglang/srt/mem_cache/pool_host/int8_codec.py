@@ -42,6 +42,10 @@ ROW_BYTES = PAYLOAD_BYTES + SCALE_BYTES + PADDING_BYTES  # 1152
 #: Byte offset of the BF16 scale block inside a record.
 SCALE_OFFSET = PAYLOAD_BYTES  # 1024
 
+#: KV heads the fixed V1 record is sized for: Qwen3-8B at TP=1.
+#: ``EXPECTED_KV_HEADS * head_dim == PAYLOAD_BYTES``.
+EXPECTED_KV_HEADS = 8
+
 #: Quantiser full scale. ``-128`` is deliberately unused so the range is
 #: symmetric and sign handling cannot drift.
 QUANT_MAX = 127
@@ -61,12 +65,34 @@ SCALE_FLOOR = AMAX_FLOOR / QUANT_MAX
 
 
 def check_layout(head_num: int, head_dim: int, itemsize: int) -> None:
-    """Fail fast if the record cannot represent this K/V geometry."""
+    """Fail fast if the record cannot represent this K/V geometry.
+
+    The V1 record is a *fixed* 1024-byte payload plus 16 scale bytes, sized for
+    Qwen3-8B at TP=1 (8 local KV heads x 128 dims). ``head_num`` here is the
+    per-rank local KV head count, so a different TP size changes it and the
+    record no longer fits. That case is reported as a TP restriction rather than
+    a byte mismatch, because "payload is 1024 but geometry is 512" tells the
+    reader nothing about what to do.
+    """
     expected_payload = head_num * head_dim
     if PAYLOAD_BYTES != expected_payload:
+        if head_dim == 128 and head_num != EXPECTED_KV_HEADS:
+            tp = EXPECTED_KV_HEADS / head_num
+            tp_note = (
+                f" This looks like TP={tp:g}: {head_num} local KV heads."
+                if tp == int(tp) and tp > 1
+                else ""
+            )
+            raise ValueError(
+                f"HiQCache V1 supports Qwen3-8B TP=1 only "
+                f"({EXPECTED_KV_HEADS} local KV heads, {PAYLOAD_BYTES} payload "
+                f"bytes). This pool has {head_num} local KV heads "
+                f"({expected_payload} bytes).{tp_note} TP-sharded record formats "
+                f"are future work."
+            )
         raise ValueError(
             f"INT8 record payload is {PAYLOAD_BYTES} bytes but this pool has "
-            f"head_num*head_dim={head_num * head_dim} elements per row."
+            f"head_num*head_dim={expected_payload} elements per row."
         )
     expected_scales = head_num * 2
     if SCALE_BYTES != expected_scales:

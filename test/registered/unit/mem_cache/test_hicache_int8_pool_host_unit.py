@@ -241,9 +241,24 @@ class TestTransferRoundtrip(_Int8PoolTestCase):
         raw = device_pool.k_buffer[0][src]
         stored = host_pool.k_data_refs[0][dst.cpu()]
         self.assertEqual(stored.dtype, torch.uint8)
-        # 1152 encoded bytes per row against 2048 raw bytes.
         self.assertEqual(stored.numel(), len(src) * codec.ROW_BYTES)
-        self.assertLess(stored.numel(), raw.numel())
+
+        # Compare BYTES, not element counts. `raw` is bf16, so its element count
+        # is half its byte count; comparing stored.numel() (uint8 bytes) against
+        # raw.numel() (bf16 elements) mixed units and made the encoded arena look
+        # larger than the raw one.
+        stored_bytes = stored.numel() * stored.element_size()
+        raw_bytes = raw.numel() * raw.element_size()
+        self.assertEqual(raw_bytes, len(src) * HEAD_NUM * HEAD_DIM * 2)
+        self.assertLess(
+            stored_bytes,
+            raw_bytes,
+            f"encoded {stored_bytes} B must be smaller than raw {raw_bytes} B",
+        )
+        self.assertAlmostEqual(
+            raw_bytes / stored_bytes, 2048 / 1152, places=6,
+            msg="compression per row should be exactly one bf16 row over one record",
+        )
         # Decoding the arena must reproduce the device row within bound, which
         # proves it really is an encoding rather than padding.
         decoded = codec.decode_records(

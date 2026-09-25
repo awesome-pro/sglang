@@ -47,7 +47,6 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
-    can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
@@ -69,6 +68,46 @@ SUPPORTED_LAYOUTS = ("layer_first",)
 #: io_backend values the pool can use. ``direct`` and ``kernel_ascend`` both
 #: assume raw BF16 rows in the host buffer.
 SUPPORTED_IO_BACKENDS = ("kernel",)
+
+
+def _retire(buffers: staging.StagingBuffers, device: torch.device | str) -> None:
+    """Make a replaced staging allocation safe to free.
+
+    Dropping the last Python reference to a CUDA tensor returns its block to the
+    caching allocator, which may then hand the same memory to a new allocation.
+    If a transfer stream still has work queued against the old block, that work
+    would read memory that has since been reused -- corruption that surfaces as
+    wrong KV rather than as an error.
+
+    ``record_stream`` defers reuse until every stream recorded on the tensor has
+    passed the point where it was used. The transfer streams are named explicitly
+    rather than taken from ``torch.cuda.current_stream()``: the transfer engine
+    wraps each submission in ``device_module.stream(...)``, so the work was
+    enqueued on one of those two, and "current" here means whatever stream the
+    caller happened to be on.
+
+    Both directions are recorded because either may hold work against staging.
+    Called on growth only; the steady-state path allocates nothing.
+    """
+    if torch.device(device).type != "cuda":
+        return
+    # Imported lazily: l2_transfer is imported by the controller that builds this
+    # pool, so a module-level import here would be circular.
+    try:
+        from sglang.srt.mem_cache import l2_transfer
+    except ImportError:  # pragma: no cover - only during partial installs
+        return
+    for stream in (
+        getattr(l2_transfer, "device_to_host_stream", None),
+        getattr(l2_transfer, "host_to_device_stream", None),
+    ):
+        if stream is None:
+            continue
+        for tensor in (buffers.k, buffers.v):
+            try:
+                tensor.record_stream(stream)
+            except Exception:  # noqa: BLE001 - cleanup must never break a transfer
+                pass
 
 
 class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
@@ -177,6 +216,23 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             raise NotImplementedError(
                 "INT8 HiCache host pool requires the NHD device KV layout."
             )
+        # TP=1 is a hard restriction, not an accident of the payload width. The
+        # record is fixed at 8 heads x 128 dims == 1024 payload bytes plus 16
+        # scale bytes; at TP=2 there are 4 local KV heads (512 + 8 bytes), so the
+        # padding, the alignment proof, the capacity maths, the JIT geometry and
+        # every benchmark change with it. Reject it by name so the failure is
+        # legible instead of surfacing as a payload/geometry mismatch inside
+        # codec.check_layout.
+        local_kv_heads = device_pool.row_dim // device_pool.head_dim
+        if local_kv_heads != codec.EXPECTED_KV_HEADS:
+            raise NotImplementedError(
+                f"HiQCache V1 supports Qwen3-8B TP=1 only: "
+                f"{codec.EXPECTED_KV_HEADS} local KV heads x "
+                f"{device_pool.head_dim} dims = {codec.PAYLOAD_BYTES} payload "
+                f"bytes. This device pool exposes {local_kv_heads} local KV heads, "
+                f"so the model or TP size differs. TP-sharded record formats are "
+                f"future work."
+            )
         if getattr(device_pool, "layer_shard_enabled", False):
             raise NotImplementedError(
                 "INT8 HiCache host pool does not support layer-sharded device pools."
@@ -196,6 +252,11 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
                 f"pool page_size; got host {page_size} vs device "
                 f"{device_pool.page_size}."
             )
+        # Only the mover this pool actually calls. The staged write-back kernel
+        # (can_use_write_back_jit_kernel) is used by the inherited page_first
+        # path, which this pool rejects outright, and its module is never
+        # imported here -- requiring it would reject a working system because an
+        # unused kernel failed to build.
         if not can_use_hicache_jit_kernel(
             element_size=codec.ROW_BYTES,
             page_size=page_size,
@@ -203,11 +264,6 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             raise NotImplementedError(
                 f"INT8 HiCache host pool needs the JIT HiCache kernel for "
                 f"{codec.ROW_BYTES}-byte rows (CUDA or HIP)."
-            )
-        if not can_use_write_back_jit_kernel(element_size=codec.ROW_BYTES):
-            raise NotImplementedError(
-                f"INT8 HiCache host pool needs the write-back JIT kernel for "
-                f"{codec.ROW_BYTES}-byte rows."
             )
 
     def _log_configuration(self) -> None:
@@ -268,7 +324,11 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=self.layout_dim,
+            # Matches the parent's layer_first behaviour: the inherited pool
+            # passes a custom granularity only for the page-oriented layouts.
+            # None keeps the single-call registration, which is correct here
+            # because the whole arena is one contiguous token-major region.
+            registration_granularity_bytes=None,
         )
 
     def _alloc_func(self):
@@ -305,9 +365,14 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             capacity=initial,
         )
         self._rebuild_d2h_staging_tables()
-        # Token-slot index list reused by every transfer instead of rebuilding
-        # an arange per call.
-        self._staging_indices = torch.arange(
+        # Staging row indices, one list per direction. They are deliberately not
+        # shared: the two streams are independent, so a single list that one
+        # direction extends while the other still has queued work against it
+        # would be the same lifetime hazard the buffers themselves had.
+        self._d2h_indices = torch.arange(
+            initial, dtype=torch.int64, device=self.device_pool.device
+        )
+        self._h2d_indices = torch.arange(
             initial, dtype=torch.int64, device=self.device_pool.device
         )
         # Host arena destination tables: one entry per layer, fixed for the
@@ -348,16 +413,18 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             self.layer_num,
             codec.ROW_BYTES,
         )
+        old = self._d2h
         self._d2h = staging.allocate_staging(
             self.layer_num,
             codec.ROW_BYTES,
             device=self.device_pool.device,
             capacity=capacity,
         )
+        _retire(old, self.device_pool.device)
         # The staging pointer tables embed data_ptr() values, so they are only
         # valid for the allocation they were built from.
         self._rebuild_d2h_staging_tables()
-        self._staging_indices = torch.arange(
+        self._d2h_indices = torch.arange(
             capacity, dtype=torch.int64, device=self.device_pool.device
         )
 
@@ -373,33 +440,25 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             self.layer_num,
             codec.ROW_BYTES,
         )
+        old = self._h2d
         self._h2d = staging.allocate_staging(
             self.layer_num,
             codec.ROW_BYTES,
             device=self.device_pool.device,
             capacity=capacity,
         )
-        # The H2D path addresses staging with plain tensor slicing, not a
-        # pointer table, so there is nothing else to rebuild here.
+        _retire(old, self.device_pool.device)
+        self._h2d_indices = torch.arange(
+            capacity, dtype=torch.int64, device=self.device_pool.device
+        )
 
-    def _staging_index_view(self, num_tokens: int) -> torch.Tensor:
-        """First ``num_tokens`` entries of the persistent staging index list.
+    def _d2h_index_view(self, num_tokens: int) -> torch.Tensor:
+        """First ``num_tokens`` staging rows, for the D2H mover's source indices."""
+        return self._d2h_indices[:num_tokens]
 
-        Valid to use for both directions because the H2D staging buffer is never
-        larger than the index list: the list only grows alongside D2H capacity,
-        and a D2H transfer is at least as large as any H2D transfer issued
-        afterwards would need. ``_ensure_h2d_capacity`` may still grow the H2D
-        buffer beyond the list, which is harmless -- the index view is only ever
-        sliced to ``num_tokens``, and ``num_tokens`` fits by construction.
-        """
-        if num_tokens > self._staging_indices.numel():
-            # H2D can outgrow the index list if it grew while D2H did not.
-            self._staging_indices = torch.arange(
-                max(num_tokens, self._h2d.capacity),
-                dtype=torch.int64,
-                device=self.device_pool.device,
-            )
-        return self._staging_indices[:num_tokens]
+    def _h2d_index_view(self, num_tokens: int) -> torch.Tensor:
+        """First ``num_tokens`` staging rows, for the H2D mover's dest indices."""
+        return self._h2d_indices[:num_tokens]
 
     # ------------------------------------------------------------------
     # D2H: encode, then move
@@ -455,7 +514,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             indices_dst=host_indices,
             k_ptr_src=self._d2h_k_src_ptrs,
             v_ptr_src=self._d2h_v_src_ptrs,
-            indices_src=self._staging_index_view(num_tokens),
+            indices_src=self._d2h_index_view(num_tokens),
             kv_cache_src_stride_bytes=codec.ROW_BYTES,
             kv_cache_dst_stride_bytes=codec.ROW_BYTES,
             element_size=codec.ROW_BYTES,
@@ -504,21 +563,27 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             return
         self._ensure_h2d_capacity(num_tokens)
 
-        # Move the encoded records; both sides are ROW_BYTES wide. The mover
-        # copies bytes, so the uint8 buffers are reinterpreted as 576 BF16
-        # elements to satisfy run_one()'s single-dtype requirement; 576 * 2 ==
-        # 1152, so the byte width the kernel uses is unchanged.
+        # Move the encoded records. Both sides are already ROW_BYTES-wide byte
+        # buffers, so the transfer is a straight byte copy at element_dim =
+        # ROW_BYTES with uint8 on both sides:
+        #
+        #     dtype uint8 <-> uint8, element_dim 1152, itemsize 1
+        #     => element_size 1152 bytes, matching kElementSize
+        #
+        # Do NOT reinterpret one side only. run_one() binds a single
+        # SymbolicDType to all four cache tensors, so a uint8 source against a
+        # bf16 destination is rejected outright.
         k_records = self._h2d.layer_k(layer_id, num_tokens)
         v_records = self._h2d.layer_v(layer_id, num_tokens)
         jit_transfer_hicache_one_layer(
             page_size=1,
-            k_cache_dst=k_records.view(torch.bfloat16),
-            v_cache_dst=v_records.view(torch.bfloat16),
+            k_cache_dst=k_records,
+            v_cache_dst=v_records,
             k_cache_src=self.k_data_refs[host_layer_id],
             v_cache_src=self.v_data_refs[host_layer_id],
-            indices_dst=self._staging_index_view(num_tokens),
+            indices_dst=self._h2d_index_view(num_tokens),
             indices_src=host_indices,
-            element_dim=codec.ROW_BYTES // 2,
+            element_dim=codec.ROW_BYTES,
         )
 
         # Decode and scatter into the device pool. Enqueued here, before return.

@@ -329,31 +329,76 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
             device=self.device_pool.device,
         )
 
-    def _ensure_staging_capacity(self, num_tokens: int) -> None:
-        """Grow staging (never shrink) so it can hold ``num_tokens`` rows."""
+    def _ensure_d2h_capacity(self, num_tokens: int) -> None:
+        """Grow the D2H staging buffer so it can hold ``num_tokens`` rows.
+
+        Grows **only** the D2H pair. A D2H backup must never reallocate the H2D
+        buffer: the two directions run on independent streams and can be in
+        flight simultaneously, so freeing H2D storage here would pull it out from
+        under a load that is still reading it. Each direction grows only for its
+        own transfers, and always before it enqueues its own copy.
+        """
         capacity = staging.next_staging_capacity(num_tokens, self._d2h.capacity)
         if capacity == self._d2h.capacity:
             return
         logger.info(
-            "HiCache INT8 staging grew from %d to %d tokens (%d layers, %d B/row).",
+            "HiCache INT8 D2H staging grew from %d to %d tokens (%d layers, %d B/row).",
             self._d2h.capacity,
             capacity,
             self.layer_num,
             codec.ROW_BYTES,
         )
         self._d2h = staging.allocate_staging(
-            self.layer_num, codec.ROW_BYTES, device=self.device_pool.device, capacity=capacity
+            self.layer_num,
+            codec.ROW_BYTES,
+            device=self.device_pool.device,
+            capacity=capacity,
         )
-        self._h2d = staging.allocate_staging(
-            self.layer_num, codec.ROW_BYTES, device=self.device_pool.device, capacity=capacity
-        )
+        # The staging pointer tables embed data_ptr() values, so they are only
+        # valid for the allocation they were built from.
         self._rebuild_d2h_staging_tables()
         self._staging_indices = torch.arange(
             capacity, dtype=torch.int64, device=self.device_pool.device
         )
 
+    def _ensure_h2d_capacity(self, num_tokens: int) -> None:
+        """Grow the H2D staging buffer. Deliberately never touches the D2H pair."""
+        capacity = staging.next_staging_capacity(num_tokens, self._h2d.capacity)
+        if capacity == self._h2d.capacity:
+            return
+        logger.info(
+            "HiCache INT8 H2D staging grew from %d to %d tokens (%d layers, %d B/row).",
+            self._h2d.capacity,
+            capacity,
+            self.layer_num,
+            codec.ROW_BYTES,
+        )
+        self._h2d = staging.allocate_staging(
+            self.layer_num,
+            codec.ROW_BYTES,
+            device=self.device_pool.device,
+            capacity=capacity,
+        )
+        # The H2D path addresses staging with plain tensor slicing, not a
+        # pointer table, so there is nothing else to rebuild here.
+
     def _staging_index_view(self, num_tokens: int) -> torch.Tensor:
-        """First ``num_tokens`` entries of the persistent staging index list."""
+        """First ``num_tokens`` entries of the persistent staging index list.
+
+        Valid to use for both directions because the H2D staging buffer is never
+        larger than the index list: the list only grows alongside D2H capacity,
+        and a D2H transfer is at least as large as any H2D transfer issued
+        afterwards would need. ``_ensure_h2d_capacity`` may still grow the H2D
+        buffer beyond the list, which is harmless -- the index view is only ever
+        sliced to ``num_tokens``, and ``num_tokens`` fits by construction.
+        """
+        if num_tokens > self._staging_indices.numel():
+            # H2D can outgrow the index list if it grew while D2H did not.
+            self._staging_indices = torch.arange(
+                max(num_tokens, self._h2d.capacity),
+                dtype=torch.int64,
+                device=self.device_pool.device,
+            )
         return self._staging_indices[:num_tokens]
 
     # ------------------------------------------------------------------
@@ -383,7 +428,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
         num_tokens = int(device_indices.numel())
         if num_tokens == 0:
             return
-        self._ensure_staging_capacity(num_tokens)
+        self._ensure_d2h_capacity(num_tokens)
 
         device_indices = device_indices.to(torch.int64)
         head_num, head_dim = self.head_num, self.head_dim
@@ -457,7 +502,7 @@ class MHATokenToKVPoolHostINT8(MHATokenToKVPoolHost):
         num_tokens = int(device_indices.numel())
         if num_tokens == 0:
             return
-        self._ensure_staging_capacity(num_tokens)
+        self._ensure_h2d_capacity(num_tokens)
 
         # Move the encoded records; both sides are ROW_BYTES wide. The mover
         # copies bytes, so the uint8 buffers are reinterpreted as 576 BF16

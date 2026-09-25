@@ -92,11 +92,25 @@ _CODEC_TIMING_PATH_ENV = "SGLANG_HICACHE_INT8_TIMING_PATH"
 class _CodecTiming:
     """Accumulates per-phase GPU time using CUDA events."""
 
+    #: How often stop() materialises the totals to disk.
+    #:
+    #: Teardown is the least reliable place to persist anything. This used to be
+    #: written only from HostKVCache.destroy(), which is reached via
+    #: release_host_resources() on graceful shutdown -- and SGLang's SIGTERM path
+    #: never gets there. The result was that an entire measurement campaign
+    #: produced no codec_timing_*.json at all, so the Phase 17 decision had no
+    #: data, while every run looked like it had merely "not finished writing".
+    #: One synchronise per this many calls is amortised to nothing, and the file
+    #: exists while the server is still serving.
+    _FLUSH_EVERY = 100_000
+
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self.totals_ms: dict[str, float] = {}
         self.counts: dict[str, int] = {}
         self._open: dict[str, torch.cuda.Event] = {}
+        self._pending: list[tuple] = []
+        self._since_flush = 0
 
     def start(self, phase: str) -> None:
         if not self.enabled:
@@ -114,14 +128,23 @@ class _CodecTiming:
         end = torch.cuda.Event(enable_timing=True)
         end.record()
         # Recorded, not read: elapsed_time() is deferred to write().
-        self._pending = getattr(self, "_pending", [])
         self._pending.append((phase, begin, end))
+        self._since_flush += 1
+        if self._since_flush >= self._FLUSH_EVERY:
+            self._since_flush = 0
+            try:
+                self.write()
+            except Exception:  # noqa: BLE001 - instrumentation must not break serving
+                pass
 
     def write(self, path: str | None = None) -> dict:
         """Resolve the pending events and dump totals.
 
-        Called once during teardown. elapsed_time() synchronises internally,
-        which is safe here precisely because it is not on the transfer path.
+        Called periodically from stop() and again during teardown, so the
+        measurement is durable whether or not the process is ever destroyed
+        cleanly. elapsed_time() synchronises internally; the periodic call is the
+        only place that cost lands on the serving path, which is why it is
+        amortised over _FLUSH_EVERY calls rather than done every time.
         """
         if not self.enabled:
             return {}

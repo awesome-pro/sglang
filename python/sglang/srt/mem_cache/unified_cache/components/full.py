@@ -151,8 +151,10 @@ class FullComponent(TreeComponent):
                 _n = _n.parent
 
             logging.getLogger(__name__).warning(
-                "HiCache match walk: best_match=%s last_device=%s evicted=%s "
-                "backuped=%s host_value=%s parent_chain=%s -> kv_host_hit=%d",
+                "HiCache match walk: is_write_back=%s best_match=%s "
+                "last_device=%s evicted=%s backuped=%s host_value=%s "
+                "parent_chain=%s -> kv_host_hit=%d",
+                self.tree_core.is_write_back,
                 result.best_match_node.id,
                 result.last_device_node.id,
                 result.best_match_node.evicted,

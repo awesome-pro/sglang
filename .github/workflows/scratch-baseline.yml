@@ -1,0 +1,41 @@
+name: Scratch - Baseline main (neighbour suites)
+
+# TEMPORARY. Runs the same neighbour suites as scratch-validate-fixes.yml but on
+# an unmodified main, to tell a pre-existing failure apart from one introduced by
+# the two fixes. Delete before opening any PR.
+
+on:
+  push:
+    branches:
+      - ci/baseline-main
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        timeout-minutes: 40
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Neighbour suites, unmodified main
+        run: |
+          python -m pytest -v -p no:randomly \
+            test/registered/unit/disaggregation/test_mooncake_efa_allocator.py \
+            test/registered/unit/distributed/ \
+            test/registered/unit/server_args/

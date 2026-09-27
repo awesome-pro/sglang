@@ -1726,14 +1726,24 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     if cfg.disaggregation_mode != "decode":
         prefill_cfg = cfg.cuda_graph_config.prefill
+        if prefill_cfg.backend == Backend.DISABLED or cfg.chunked_prefill_size <= 0:
+            return False
         # We can only skip eager activation headroom when the largest
         # prefill forward batch size is already graph-captured. Otherwise,
         # an eager forward will need more memory and lead to OOM.
-        if (
-            prefill_cfg.backend == Backend.DISABLED
-            or cfg.chunked_prefill_size <= 0
-            or max_prefill_buffer_tokens(server_args) > max(prefill_cfg.bs or (0,))
-        ):
+        prefill_buffer_tokens = max_prefill_buffer_tokens(server_args)
+        max_captured_prefill_tokens = max(prefill_cfg.bs or (0,))
+        if prefill_buffer_tokens > max_captured_prefill_tokens:
+            logger.warning(
+                "Post-capture KV sizing is disabled because the prefill CUDA graph "
+                "does not cover every reachable prefill batch: the prefill buffer "
+                "ceiling is %d tokens but the largest captured prefill bucket is "
+                "%d. Raise --cuda-graph-max-bs-prefill to at least %d, or lower "
+                "--chunked-prefill-size, to enable post-capture KV sizing.",
+                prefill_buffer_tokens,
+                max_captured_prefill_tokens,
+                prefill_buffer_tokens,
+            )
             return False
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse

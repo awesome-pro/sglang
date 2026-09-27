@@ -1,0 +1,66 @@
+name: Scratch - Validate CPU unit tests
+
+# TEMPORARY. Not for merge: this exists only to run two CPU-only unit tests on a
+# hosted Linux runner (the author's machine is macOS/arm64, where sglang's
+# dependency set is not installable). Delete before opening any PR.
+#
+# Mirrors the install step of .github/workflows/_pr-test-stage-cpu.yml. No Rust
+# toolchain is needed: the main python/pyproject.toml declares no
+# [tool.sglang] rust-extensions allowlist, so the editable install does not
+# build rust/sglang-grpc.
+
+on:
+  push:
+    branches:
+      - ci/validate-cpu-tests
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        timeout-minutes: 40
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Confirm the import resolves to the checkout
+        run: |
+          python -c "import sglang, sys; print('sglang at', sglang.__file__)"
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+      - name: Repro under test - post-capture KV sizing warning (#33852)
+        run: |
+          python -m pytest -v -p no:randomly \
+            test/registered/unit/server_args/test_post_capture_kv_sizing_warning.py
+
+      - name: Repro under test - custom AR v2 capability (#36429)
+        run: |
+          python -m pytest -v -p no:randomly \
+            test/registered/unit/distributed/test_custom_all_reduce_v2_capability.py
+
+      - name: Neighbour suites that touch the same code paths
+        if: always()
+        run: |
+          python -m pytest -v -p no:randomly \
+            test/registered/unit/disaggregation/test_mooncake_efa_allocator.py \
+            test/registered/unit/distributed/ \
+            test/registered/unit/server_args/
+
+      - name: Summary
+        if: always()
+        run: echo "See job log for per-file results."
